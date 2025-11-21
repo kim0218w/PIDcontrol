@@ -1234,6 +1234,20 @@ def main():
             if s_curve_gamma_decel is not None and s_curve_gamma_decel != s_curve_gamma:
                 extra += f", gamma2={s_curve_gamma_decel}"
             print(f"[{name}] steps={steps}, accel_ratio={accel_ratio}, gamma={s_curve_gamma}{extra}, direction={direction}, PID={use_pid} gains={pid_gains if use_pid else '-'}{speed_info}")
+            
+            # Show which encoders will be used
+            if use_pid and enc_channels:
+                print(f"[INFO] PID control will use encoder: {enc_channels[0]}")
+            if enc_channels:
+                print(f"[INFO] Logging from encoders: {enc_channels}")
+            
+            # Check GPIO encoder status before movement
+            initial_count = 0
+            initial_angle = 0.0
+            if gpio_enc is not None:
+                initial_count = gpio_enc.read_pulses()
+                initial_angle = gpio_enc.read_angle_deg()
+                print(f"[DEBUG] GPIO Encoder before movement - Count: {initial_count}, Angle: {initial_angle:.2f} deg")
 
             enable_motor(h, ena_pin, True)
             if use_pid and enc_channels:
@@ -1244,7 +1258,7 @@ def main():
                     pid_gains=pid_gains,
                     log_enc=True, enc=enc, enc_channels=enc_channels, enc_sample_dt=ENC_SAMPLE_DT,
                     decel_ratio=decel_ratio, s_curve_gamma_decel=s_curve_gamma_decel,
-                    encoders_dict=encoders_dict
+                    encoders_dict=encoders
                 )
             else:
                 logs = move_stepper_scurve_with_logging(
@@ -1253,14 +1267,57 @@ def main():
                     s_curve_gamma=s_curve_gamma,
                     log_enc=bool(enc_channels), enc=enc, enc_channels=enc_channels, enc_sample_dt=ENC_SAMPLE_DT,
                     decel_ratio=decel_ratio, s_curve_gamma_decel=s_curve_gamma_decel,
-                    encoders_dict=encoders_dict
+                    encoders_dict=encoders
                 )
             enable_motor(h, ena_pin, False)
+            
+            # Check GPIO encoder status after movement
+            if gpio_enc is not None:
+                final_count = gpio_enc.read_pulses()
+                final_angle = gpio_enc.read_angle_deg()
+                count_change = final_count - initial_count
+                angle_change = final_angle - initial_angle
+                print(f"[DEBUG] GPIO Encoder after movement - Count: {final_count}, Angle: {final_angle:.2f} deg")
+                print(f"[DEBUG] GPIO Encoder change - Count: {count_change:+d}, Angle: {angle_change:+.2f} deg")
+                if count_change == 0:
+                    print("[WARN] GPIO Encoder count did not change! Check encoder connection.")
 
             if logs is None or 't' not in logs or len(logs['t']) < 3:
                 print("[INFO] No data to plot.")
                 continue
 
+            # ===== Encoder Debug Information =====
+            print("\n" + "="*60)
+            print("ENCODER DEBUG INFORMATION")
+            print("="*60)
+            
+            encoder_found = False
+            for ch in enc_channels:
+                enc_key = f"enc_{ch}"
+                if enc_key in logs:
+                    enc_data = logs[enc_key]
+                    valid_count = np.sum(~np.isnan(enc_data))
+                    print(f"[DEBUG] Encoder '{ch}':")
+                    print(f"  - Samples: {len(enc_data)}")
+                    print(f"  - Valid: {valid_count}/{len(enc_data)} ({100*valid_count/len(enc_data):.1f}%)")
+                    print(f"  - Min: {np.nanmin(enc_data):.2f} deg, Max: {np.nanmax(enc_data):.2f} deg")
+                    print(f"  - Range: {np.nanmax(enc_data) - np.nanmin(enc_data):.2f} deg")
+                    if len(enc_data) >= 10:
+                        print(f"  - First 10 values: {enc_data[:10]}")
+                    encoder_found = True
+                else:
+                    print(f"[WARN] Encoder '{ch}' not in logs")
+            
+            if not encoder_found:
+                print("[ERROR] No encoder data in logs!")
+                print("[ERROR] GPIO encoder (pins 2,3) may not be working properly.")
+                print("[ERROR] Please check:")
+                print("  1. Encoder wiring connections")
+                print("  2. Encoder power supply")
+                print("  3. Encoder is generating pulses when motor moves")
+            
+            print("="*60 + "\n")
+            
             t = logs['t']
             cmd_rate = logs.get('cmd_rate', None)
             cmd_ang_vel = cmd_rate * DEG_PER_STEP if cmd_rate is not None else None
@@ -1335,11 +1392,11 @@ def main():
                         # Quality assessment
                         quality_issues = []
                         if metrics['overshoot_percent'] > 10:
-                            quality_issues.append("?좑툘  High overshoot (>10%) - Consider reducing Kp or increasing Kd")
+                            quality_issues.append("⚠️  High overshoot (>10%) - Consider reducing Kp or increasing Kd")
                         if abs(metrics['steady_state_error_abs']) > 0.5:
-                            quality_issues.append("?좑툘  High steady-state error - Consider increasing Ki")
+                            quality_issues.append("⚠️  High steady-state error - Consider increasing Ki")
                         if metrics['settling_time'] is None:
-                            quality_issues.append("?좑툘  System did not settle - Tune gains or increase test duration")
+                            quality_issues.append("⚠️  System did not settle - Tune gains or increase test duration")
                         
                         if quality_issues:
                             print("PID TUNING RECOMMENDATIONS:")
@@ -1347,7 +1404,7 @@ def main():
                                 print(f"  {issue}")
                             print()
                         else:
-                            print("??PID performance is good!\n")
+                            print("✅ PID performance is good!\n")
                 
                 # Plot PID-specific data
                 if pid_error is not None and len(pid_error) == len(t):
@@ -1401,13 +1458,13 @@ def main():
                 vel_labels = []
                 if cmd_ang_vel is not None:
                     vel_series.append(cmd_ang_vel)
-                    vel_labels.append("commanded ? [deg/s]")
+                    vel_labels.append("commanded ω [deg/s]")
                 if has_pulse_vel:
                     vel_series.append(pulse_deg_per_s)
-                    vel_labels.append("pulse ? raw [deg/s]")
+                    vel_labels.append("pulse ω raw [deg/s]")
                 if has_pulse_vel_f:
                     vel_series.append(pulse_deg_per_s_filtered)
-                    vel_labels.append("pulse ? LPF [deg/s]")
+                    vel_labels.append("pulse ω LPF [deg/s]")
                 plot_time_series(t, vel_series, vel_labels, "Pulse-derived Angular Velocity", "Angular velocity (deg/s)", "pulse_speed_deg")
                 pulse_vel_plot = True
 
@@ -1434,12 +1491,12 @@ def main():
                 pos_labels = []
                 if cmd_angle is not None:
                     pos_series.append(cmd_angle)
-                    pos_labels.append("commanded 罐 [deg]")
+                    pos_labels.append("commanded θ [deg]")
                     pulse_deg_aligned = pulse_deg - pulse_deg[0] + cmd_angle[0]
                 else:
                     pulse_deg_aligned = pulse_deg
                 pos_series.append(pulse_deg_aligned)
-                pos_labels.append("pulse 罐 [deg]")
+                pos_labels.append("pulse θ [deg]")
                 plot_time_series(t, pos_series, pos_labels, "Pulse-derived Angle", "Angle (deg)", "pulse_angle_deg")
                 pulse_pos_plot = True
 
@@ -1470,9 +1527,9 @@ def main():
                 # No encoder data available: fall back to command-only plots (unless already shown).
                 if cmd_rate is not None:
                     if cmd_ang_vel is not None and not pulse_vel_plot:
-                        plot_time_series(t, [cmd_ang_vel], ["commanded ?"], "Commanded Angular Velocity", "Angular velocity (deg/s)", "cmd_angular_velocity")
+                        plot_time_series(t, [cmd_ang_vel], ["commanded ω"], "Commanded Angular Velocity", "Angular velocity (deg/s)", "cmd_angular_velocity")
                         if cmd_angle is not None and not pulse_pos_plot:
-                            plot_time_series(t, [cmd_angle], ["commanded 罐"], "Commanded Angle (integrated)", "Angle (deg)", "cmd_angle")
+                            plot_time_series(t, [cmd_angle], ["commanded θ"], "Commanded Angle (integrated)", "Angle (deg)", "cmd_angle")
                     plot_time_series(t, [cmd_rate], ["cmd step rate"], "Commanded Step Rate", "Steps per second", "cmd_step_rate")
                 continue
 
@@ -1492,17 +1549,17 @@ def main():
                 # Plot encoder angles against commands when available.
                 if cmd_angle is not None:
                     cmd_angle_aligned = cmd_angle - cmd_angle[0] + ang_unwrapped[0]
-                    plot_time_series(t, [ang_unwrapped, cmd_angle_aligned], [f"ch{ch} measured 罐", "commanded 罐"], f"Encoder ch{ch} Angle", "Angle (deg)", f"ch{ch}_angle_overlay")
+                    plot_time_series(t, [ang_unwrapped, cmd_angle_aligned], [f"ch{ch} measured θ", "commanded θ"], f"Encoder ch{ch} Angle", "Angle (deg)", f"ch{ch}_angle_overlay")
                 else:
-                    plot_time_series(t, [ang_unwrapped], [f"ch{ch} measured 罐"], f"Encoder ch{ch} Angle", "Angle (deg)", f"ch{ch}_angle")
+                    plot_time_series(t, [ang_unwrapped], [f"ch{ch} measured θ"], f"Encoder ch{ch} Angle", "Angle (deg)", f"ch{ch}_angle")
 
                 # Likewise compare encoder velocity and acceleration.
                 if cmd_ang_vel is not None:
-                    plot_time_series(t, [vel, cmd_ang_vel], [f"ch{ch} measured ?", "commanded ?"], f"Encoder ch{ch} Angular Velocity", "Angular velocity (deg/s)", f"ch{ch}_angular_velocity_overlay")
+                    plot_time_series(t, [vel, cmd_ang_vel], [f"ch{ch} measured ω", "commanded ω"], f"Encoder ch{ch} Angular Velocity", "Angular velocity (deg/s)", f"ch{ch}_angular_velocity_overlay")
                 else:
-                    plot_time_series(t, [vel], [f"ch{ch} measured ?"], f"Encoder ch{ch} Angular Velocity", "Angular velocity (deg/s)", f"ch{ch}_angular_velocity")
+                    plot_time_series(t, [vel], [f"ch{ch} measured ω"], f"Encoder ch{ch} Angular Velocity", "Angular velocity (deg/s)", f"ch{ch}_angular_velocity")
 
-                plot_time_series(t, [acc], [f"ch{ch} measured 慣"], f"Encoder ch{ch} Angular Acceleration", "Angular acceleration (deg/s^2)", f"ch{ch}_angular_acceleration")
+                plot_time_series(t, [acc], [f"ch{ch} measured α"], f"Encoder ch{ch} Angular Acceleration", "Angular acceleration (deg/s^2)", f"ch{ch}_angular_acceleration")
 
     except KeyboardInterrupt:
         print("\n[Interrupted]")
