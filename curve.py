@@ -45,8 +45,8 @@ IN1_PIN = 5
 IN2_PIN = 6
 PWM_PIN = 13
 
-ENC_PIN_A = 2  # Encoder A channel (GPIO pin 2)
-ENC_PIN_B = 3  # Encoder B channel (GPIO pin 3)
+ENC_PIN_A = 2  # I2C SDA (for AS5600 magnetic encoder)
+ENC_PIN_B = 3  # I2C SCL (for AS5600 magnetic encoder)
 
 # -------------------- Motion params --------------------
 MIN_DELAY_17 = 0.0005
@@ -65,8 +65,8 @@ TX_BACKLOG = 8
 ACT_TIME       = 7
 ENC_SAMPLE_DT  = 0.015
 MUX_ADDR       = 0x70
-ENCODER_ADDR   = 0x36
-ENC_REG_ANGLE  = 0x0E
+ENCODER_ADDR   = 0x36  # AS5600 I2C address
+ENC_REG_ANGLE  = 0x0E  # Angle register for multiplexed encoders
 
 DEG_PER_STEP = 0.018  # 10000 steps = 180 deg
 PULSES_PER_REV = 360.0 / DEG_PER_STEP if DEG_PER_STEP else float("nan")
@@ -131,9 +131,113 @@ class EncoderMux:
             pass
         return ok
 
-# -------------------- GPIO Quadrature Encoder --------------------
+# -------------------- AS5600 Magnetic Encoder (I2C) --------------------
+class AS5600Encoder:
+    """AS5600 absolute magnetic encoder via I2C on GPIO 2,3 (SDA,SCL)"""
+    def __init__(self, bus_num=1, i2c_addr=0x36, pulses_per_rev=None):
+        """
+        Initialize AS5600 encoder.
+        
+        Args:
+            bus_num: I2C bus number (usually 1 for Raspberry Pi)
+            i2c_addr: I2C address of AS5600 (default 0x36)
+            pulses_per_rev: Pulses per revolution for compatibility
+        """
+        if smbus is None:
+            raise RuntimeError("smbus not available. Install: sudo apt-get install python3-smbus")
+        
+        self.bus = smbus.SMBus(bus_num)
+        self.addr = i2c_addr
+        self.pulses_per_rev = pulses_per_rev if pulses_per_rev else PULSES_PER_REV
+        self.angle_reg = 0x0C  # Raw angle register (12-bit)
+        self.last_angle_deg = 0.0
+        self.offset_angle = 0.0  # For reset functionality
+        
+        # Test read to verify connection
+        try:
+            self.read_angle_deg()
+        except Exception as e:
+            raise RuntimeError(f"AS5600 not responding at 0x{i2c_addr:02X}: {e}")
+    
+    def read_angle_deg(self):
+        """Read absolute angle from AS5600 (0-360 degrees)"""
+        try:
+            # Read 2 bytes from raw angle register
+            data = self.bus.read_i2c_block_data(self.addr, self.angle_reg, 2)
+            # Combine into 12-bit value
+            raw = ((data[0] << 8) | data[1]) & 0x0FFF
+            # Convert to degrees (0-360)
+            angle = raw * 360.0 / 4096.0
+            # Apply offset for reset functionality
+            angle = (angle - self.offset_angle) % 360.0
+            self.last_angle_deg = angle
+            return angle
+        except Exception as e:
+            # Return last known value on error
+            return self.last_angle_deg
+    
+    def read_pulses(self):
+        """Convert current angle to pulse count"""
+        angle = self.read_angle_deg()
+        if self.pulses_per_rev > 0:
+            return int((angle / 360.0) * self.pulses_per_rev)
+        return 0
+    
+    def update(self):
+        """Update encoder reading (called periodically)"""
+        self.read_angle_deg()
+    
+    def try_read_channel(self, ch=None):
+        """Compatibility method for encoder interface"""
+        return self.read_angle_deg()
+    
+    def select_channel(self, ch=None):
+        """Compatibility method (no-op for single encoder)"""
+        pass
+    
+    def reset(self):
+        """Reset: set current position as zero reference"""
+        self.offset_angle = self.read_angle_deg_raw()
+        self.last_angle_deg = 0.0
+    
+    def read_angle_deg_raw(self):
+        """Read raw angle without offset"""
+        try:
+            data = self.bus.read_i2c_block_data(self.addr, self.angle_reg, 2)
+            raw = ((data[0] << 8) | data[1]) & 0x0FFF
+            return raw * 360.0 / 4096.0
+        except Exception:
+            return 0.0
+    
+    def get_magnet_status(self):
+        """Check magnet detection status
+        Returns: (detected, too_weak, too_strong)
+        """
+        try:
+            status = self.bus.read_byte_data(self.addr, 0x0B)
+            md = (status >> 5) & 1  # Magnet detected
+            ml = (status >> 4) & 1  # Magnet too weak
+            mh = (status >> 3) & 1  # Magnet too strong
+            return (bool(md), bool(ml), bool(mh))
+        except Exception:
+            return (False, False, False)
+    
+    def get_agc_value(self):
+        """Get Automatic Gain Control value (0-255)
+        Optimal range: 128 ± 32
+        """
+        try:
+            return self.bus.read_byte_data(self.addr, 0x1A)
+        except Exception:
+            return 0
+
+# -------------------- GPIO Quadrature Encoder (Legacy) --------------------
 class GPIOEncoder:
-    """Quadrature encoder reader using GPIO pins 2 and 3."""
+    """Quadrature encoder reader using GPIO pins 2 and 3.
+    
+    NOTE: This class is for actual quadrature encoders with A/B pulse signals.
+    If using AS5600 magnetic encoder, use AS5600Encoder instead.
+    """
     def __init__(self, h, pin_a=ENC_PIN_A, pin_b=ENC_PIN_B, pulses_per_rev=None):
         """
         Initialize GPIO encoder.
@@ -994,13 +1098,36 @@ def main():
     
     h = lgpio.gpiochip_open(0)
     
-    # Initialize GPIO encoder (pins 2 and 3)
+    # Initialize AS5600 magnetic encoder via I2C (GPIO 2,3 = SDA,SCL)
     gpio_enc = None
     try:
-        gpio_enc = GPIOEncoder(h, pin_a=ENC_PIN_A, pin_b=ENC_PIN_B)
-        print(f"[INFO] GPIO encoder initialized on pins {ENC_PIN_A} and {ENC_PIN_B}")
+        gpio_enc = AS5600Encoder(bus_num=1, i2c_addr=0x36)
+        test_angle = gpio_enc.read_angle_deg()
+        magnet_ok, too_weak, too_strong = gpio_enc.get_magnet_status()
+        agc = gpio_enc.get_agc_value()
+        
+        print(f"[INFO] AS5600 magnetic encoder initialized via I2C (GPIO 2=SDA, 3=SCL)")
+        print(f"[INFO] Current angle: {test_angle:.2f} degrees")
+        print(f"[INFO] I2C Address: 0x36")
+        print(f"[INFO] Magnet status: {'✓ OK' if magnet_ok else '✗ NOT DETECTED'}")
+        
+        if too_weak:
+            print(f"[WARN] Magnet too weak - move magnet closer to sensor (1-3mm)")
+        elif too_strong:
+            print(f"[WARN] Magnet too strong - move magnet farther from sensor")
+        
+        print(f"[INFO] AGC value: {agc} (optimal: 96-160, current: {'✓' if 96 <= agc <= 160 else '⚠'})")
+        
+        if not magnet_ok:
+            print(f"[WARN] Magnet not detected! Encoder readings may be unreliable.")
+            
     except Exception as e:
-        print(f"[WARN] GPIO encoder init failed: {e}")
+        print(f"[WARN] AS5600 encoder init failed: {e}")
+        print(f"[INFO] Troubleshooting:")
+        print(f"       1. Enable I2C: sudo raspi-config -> Interface Options -> I2C")
+        print(f"       2. Check I2C devices: i2cdetect -y 1")
+        print(f"       3. Install smbus: sudo apt-get install python3-smbus")
+        print(f"       4. Check AS5600 wiring and magnet position")
         gpio_enc = None
     
     # Initialize I2C encoder (if available)
@@ -1241,13 +1368,12 @@ def main():
             if enc_channels:
                 print(f"[INFO] Logging from encoders: {enc_channels}")
             
-            # Check GPIO encoder status before movement
+            # Check encoder status before movement
             initial_count = 0
             initial_angle = 0.0
             if gpio_enc is not None:
-                initial_count = gpio_enc.read_pulses()
                 initial_angle = gpio_enc.read_angle_deg()
-                print(f"[DEBUG] GPIO Encoder before movement - Count: {initial_count}, Angle: {initial_angle:.2f} deg")
+                print(f"[DEBUG] Encoder before movement - Angle: {initial_angle:.2f} deg")
 
             enable_motor(h, ena_pin, True)
             if use_pid and enc_channels:
@@ -1271,16 +1397,22 @@ def main():
                 )
             enable_motor(h, ena_pin, False)
             
-            # Check GPIO encoder status after movement
+            # Check encoder status after movement
             if gpio_enc is not None:
-                final_count = gpio_enc.read_pulses()
                 final_angle = gpio_enc.read_angle_deg()
-                count_change = final_count - initial_count
                 angle_change = final_angle - initial_angle
-                print(f"[DEBUG] GPIO Encoder after movement - Count: {final_count}, Angle: {final_angle:.2f} deg")
-                print(f"[DEBUG] GPIO Encoder change - Count: {count_change:+d}, Angle: {angle_change:+.2f} deg")
-                if count_change == 0:
-                    print("[WARN] GPIO Encoder count did not change! Check encoder connection.")
+                # Handle wrap-around for absolute encoder
+                if angle_change > 180:
+                    angle_change -= 360
+                elif angle_change < -180:
+                    angle_change += 360
+                print(f"[DEBUG] Encoder after movement - Angle: {final_angle:.2f} deg")
+                print(f"[DEBUG] Encoder change - Angle: {angle_change:+.2f} deg")
+                if abs(angle_change) < 0.5:
+                    print("[WARN] Encoder angle did not change significantly! Check:")
+                    print("       - AS5600 magnet position (should be 1-3mm from sensor)")
+                    print("       - Motor is actually rotating")
+                    print("       - Encoder is mechanically coupled to motor shaft")
 
             if logs is None or 't' not in logs or len(logs['t']) < 3:
                 print("[INFO] No data to plot.")
@@ -1310,11 +1442,13 @@ def main():
             
             if not encoder_found:
                 print("[ERROR] No encoder data in logs!")
-                print("[ERROR] GPIO encoder (pins 2,3) may not be working properly.")
+                print("[ERROR] AS5600 encoder (I2C via GPIO 2,3) may not be working properly.")
                 print("[ERROR] Please check:")
-                print("  1. Encoder wiring connections")
-                print("  2. Encoder power supply")
-                print("  3. Encoder is generating pulses when motor moves")
+                print("  1. I2C is enabled: sudo raspi-config -> Interface Options -> I2C")
+                print("  2. I2C devices detected: i2cdetect -y 1 (should show 0x36)")
+                print("  3. AS5600 power supply (VCC=3.3V or 5V, GND)")
+                print("  4. Magnet is positioned correctly (1-3mm from sensor)")
+                print("  5. Motor/encoder shaft coupling is secure")
             
             print("="*60 + "\n")
             
