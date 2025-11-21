@@ -1,4 +1,10 @@
-
+# -*- coding: utf-8 -*-
+# ----------------------------------------
+# Stepper motor and actuator control utils
+# ----------------------------------------# -*- coding: utf-8 -*-
+# ---------------------------------
+# Stepper motor S-curve motion with PID control and encoder logging
+# ---------------------------------
 import time
 import time
 import math
@@ -38,6 +44,9 @@ ENA_PIN_NAMA_23  = 16
 IN1_PIN = 5
 IN2_PIN = 6
 PWM_PIN = 13
+
+ENC_PIN_A = 2  # Encoder A channel (GPIO pin 2)
+ENC_PIN_B = 3  # Encoder B channel (GPIO pin 3)
 
 # -------------------- Motion params --------------------
 MIN_DELAY_17 = 0.0005
@@ -121,6 +130,103 @@ class EncoderMux:
         except Exception:
             pass
         return ok
+
+# -------------------- GPIO Quadrature Encoder --------------------
+class GPIOEncoder:
+    """Quadrature encoder reader using GPIO pins 2 and 3."""
+    def __init__(self, h, pin_a=ENC_PIN_A, pin_b=ENC_PIN_B, pulses_per_rev=None):
+        """
+        Initialize GPIO encoder.
+        
+        Args:
+            h: GPIO chip handle
+            pin_a: GPIO pin for encoder A channel
+            pin_b: GPIO pin for encoder B channel
+            pulses_per_rev: Pulses per revolution (if None, uses PULSES_PER_REV)
+        """
+        if lgpio is None:
+            raise RuntimeError("lgpio not available. Run on Raspberry Pi.")
+        self.h = h
+        self.pin_a = pin_a
+        self.pin_b = pin_b
+        self.pulses_per_rev = pulses_per_rev if pulses_per_rev is not None else PULSES_PER_REV
+        
+        # Claim pins as inputs
+        lgpio.gpio_claim_input(h, pin_a)
+        lgpio.gpio_claim_input(h, pin_b)
+        
+        # Initialize encoder state
+        self.last_state_a = lgpio.gpio_read(h, pin_a)
+        self.last_state_b = lgpio.gpio_read(h, pin_b)
+        self.pulse_count = 0
+        self.last_angle_deg = 0.0
+        
+        # Quadrature state machine: 00, 01, 11, 10
+        # State transitions determine direction
+        self.last_quad_state = (self.last_state_a << 1) | self.last_state_b
+        
+    def read_pulses(self):
+        """Read current pulse count."""
+        return self.pulse_count
+    
+    def read_angle_deg(self):
+        """Read current angle in degrees."""
+        if self.pulses_per_rev > 0:
+            angle = (self.pulse_count / self.pulses_per_rev) * 360.0
+            self.last_angle_deg = angle
+            return angle
+        return self.last_angle_deg
+    
+    def update(self):
+        """Update encoder state by reading GPIO pins and counting pulses."""
+        try:
+            state_a = lgpio.gpio_read(self.h, self.pin_a)
+            state_b = lgpio.gpio_read(self.h, self.pin_b)
+            
+            # Current quadrature state (2-bit: A, B)
+            # Encoding: state = (A << 1) | B
+            # 00 -> 0, 01 -> 1, 10 -> 2, 11 -> 3
+            quad_state = (state_a << 1) | state_b
+            
+            # Detect state change
+            if quad_state != self.last_quad_state:
+                # Quadrature decoding: determine direction from state transition
+                # Valid forward transitions: 0->1->3->2->0
+                # Valid reverse transitions: 0->2->3->1->0
+                
+                # Calculate direction based on state transition
+                # Forward: increment, Reverse: decrement
+                # Use modulo arithmetic to handle wrap-around
+                diff = (quad_state - self.last_quad_state) % 4
+                
+                if diff == 1:
+                    # Forward transition (0->1, 1->3, 3->2, 2->0)
+                    self.pulse_count += 1
+                elif diff == 3:
+                    # Reverse transition (0->2->3->1->0, which is -1 mod 4)
+                    self.pulse_count -= 1
+                # If diff == 2, it's an invalid transition (skip), ignore it
+                
+                self.last_quad_state = quad_state
+                self.last_state_a = state_a
+                self.last_state_b = state_b
+                
+        except Exception:
+            pass  # Ignore read errors
+    
+    def reset(self):
+        """Reset pulse count to zero."""
+        self.pulse_count = 0
+        self.last_angle_deg = 0.0
+    
+    def try_read_channel(self, ch=None):
+        """Compatibility method: read angle in degrees."""
+        self.update()
+        return self.read_angle_deg()
+    
+    def select_channel(self, ch=None):
+        """Compatibility method: no-op for GPIO encoder."""
+        pass
 
 # -------------------- Stepper helpers --------------------
 def enable_motor(h, ena_pin, enable=True):
@@ -587,9 +693,12 @@ def move_stepper_scurve_with_logging(
     enc_sample_dt: float = ENC_SAMPLE_DT,
     decel_ratio=None,
     s_curve_gamma_decel=None,
+    encoders_dict=None,
 ):
     if enc_channels is None:
         enc_channels = []
+    if encoders_dict is None:
+        encoders_dict = {}
     if min_delay >= max_delay:
         min_delay, max_delay = sorted([min_delay, max_delay])
     min_delay = max(min_delay, MIN_SAFE_DELAY)
@@ -626,10 +735,16 @@ def move_stepper_scurve_with_logging(
     def sample_all(ts):
         nonlocal last_sample_t, last_sample_pulse_count, pulse_deg_per_s_lpf
         if ts - last_sample_t >= enc_sample_dt:
-            if log_enc and enc is not None:
+            if log_enc:
                 for ch in enc_channels:
-                    ang = enc.try_read_channel(ch)
-                    enc_logs[ch].append(ang)
+                    # Use encoder from dictionary if available, otherwise fall back to enc parameter
+                    encoder = encoders_dict.get(ch, enc)
+                    if encoder is not None:
+                        # For GPIO encoder, update state before reading
+                        if isinstance(encoder, GPIOEncoder):
+                            encoder.update()
+                        ang = encoder.try_read_channel(ch)
+                        enc_logs[ch].append(ang)
             dt = ts - last_sample_t
             if dt <= 0.0:
                 dt = 1e-6
@@ -684,11 +799,15 @@ def move_stepper_scurve_with_pid(
     enc_sample_dt: float = ENC_SAMPLE_DT,
     decel_ratio=None,
     s_curve_gamma_decel=None,
+    encoders_dict=None,
 ):
-    if enc is None or not enc_channels:
+    if encoders_dict is None:
+        encoders_dict = {}
+    if (enc is None and not encoders_dict) or not enc_channels:
         return move_stepper_scurve_with_logging(
             h, dir_pin, step_pin, total_steps, direction, min_delay, max_delay,
-            accel_ratio, s_curve_gamma, log_enc=False, enc=None, enc_channels=[], enc_sample_dt=enc_sample_dt
+            accel_ratio, s_curve_gamma, log_enc=False, enc=None, enc_channels=[], enc_sample_dt=enc_sample_dt,
+            encoders_dict=encoders_dict
         )
 
     if min_delay >= max_delay:
@@ -752,8 +871,14 @@ def move_stepper_scurve_with_pid(
         nonlocal last_sample_t, last_sample_pulse_count, pulse_deg_per_s_lpf
         if ts - last_sample_t >= enc_sample_dt:
             for ch in enc_channels:
-                val = enc.try_read_channel(ch)
-                enc_logs[ch].append(val)
+                # Use encoder from dictionary if available, otherwise fall back to enc parameter
+                encoder = encoders_dict.get(ch, enc)
+                if encoder is not None:
+                    # For GPIO encoder, update state before reading
+                    if isinstance(encoder, GPIOEncoder):
+                        encoder.update()
+                    val = encoder.try_read_channel(ch)
+                    enc_logs[ch].append(val)
             dt = ts - last_sample_t
             if dt <= 0.0:
                 dt = 1e-6
@@ -785,8 +910,17 @@ def move_stepper_scurve_with_pid(
             last_sample_t = ts
 
     fb_ch = enc_channels[0]
-    enc.select_channel(fb_ch)
-    ang0 = enc.read_angle_deg()
+    fb_encoder = encoders_dict.get(fb_ch, enc)
+    if fb_encoder is not None:
+        if isinstance(fb_encoder, GPIOEncoder):
+            fb_encoder.update()
+        fb_encoder.select_channel(fb_ch)
+        try:
+            ang0 = fb_encoder.read_angle_deg()
+        except Exception:
+            ang0 = 0.0
+    else:
+        ang0 = 0.0
     target_offset = ang0
     current_rate_steps = delay_to_rate(ff_delays[0]) if ff_delays else 0.0
 
@@ -798,10 +932,15 @@ def move_stepper_scurve_with_pid(
         target_ang = cmd_angle_ff[i] + target_offset
         current_target = target_ang
 
-        enc.select_channel(fb_ch)
-        try:
-            ang_meas = enc.read_angle_deg()
-        except Exception:
+        if fb_encoder is not None:
+            if isinstance(fb_encoder, GPIOEncoder):
+                fb_encoder.update()
+            fb_encoder.select_channel(fb_ch)
+            try:
+                ang_meas = fb_encoder.read_angle_deg()
+            except Exception:
+                ang_meas = float('nan')
+        else:
             ang_meas = float('nan')
 
         current_measured = ang_meas
@@ -852,22 +991,58 @@ def main():
     if lgpio is None:
         print("[ERROR] lgpio is not available in this environment.")
         return
+    
+    h = lgpio.gpiochip_open(0)
+    
+    # Initialize GPIO encoder (pins 2 and 3)
+    gpio_enc = None
+    try:
+        gpio_enc = GPIOEncoder(h, pin_a=ENC_PIN_A, pin_b=ENC_PIN_B)
+        print(f"[INFO] GPIO encoder initialized on pins {ENC_PIN_A} and {ENC_PIN_B}")
+    except Exception as e:
+        print(f"[WARN] GPIO encoder init failed: {e}")
+        gpio_enc = None
+    
+    # Initialize I2C encoder (if available)
     try:
         enc = EncoderMux(bus_num=1, settle=0.002, retries=3, retry_wait=0.001) if smbus is not None else None
         candidates = [0, 1]
         working = enc.detect_working_channels(candidates) if enc is not None else []
         if enc is None or not working:
-            print("[WARN] No encoder channels responded - proceeding without encoder logging.")
+            print("[WARN] No I2C encoder channels responded.")
             enc = None
             working = []
         else:
-            print("[INFO] Working encoder channels:", working)
+            print("[INFO] Working I2C encoder channels:", working)
     except Exception as e:
-        print(f"[WARN] Encoder init failed: {e}")
+        print(f"[WARN] I2C encoder init failed: {e}")
         enc = None
         working = []
-
-    h = lgpio.gpiochip_open(0)
+    
+    # Combine encoders: use GPIO encoder as primary if available, add I2C channels
+    encoders = {}
+    enc_channels = []
+    
+    if gpio_enc is not None:
+        # GPIO encoder uses channel identifier "gpio"
+        encoders["gpio"] = gpio_enc
+        enc_channels.append("gpio")
+    
+    if enc is not None and working:
+        # I2C encoder channels
+        for ch in working:
+            encoders[ch] = enc
+            enc_channels.append(ch)
+    
+    if not enc_channels:
+        print("[WARN] No encoders available - proceeding without encoder logging.")
+        enc = None
+        enc_channels = []
+    else:
+        print(f"[INFO] Total encoder channels available: {enc_channels}")
+        # For compatibility, set enc to first available encoder
+        enc = encoders[enc_channels[0]] if enc_channels else None
+    
     for pin in (
         DIR_PIN_NAMA_17, STEP_PIN_NAMA_17, ENA_PIN_NAMA_17,
         DIR_PIN_NAMA_23, STEP_PIN_NAMA_23, ENA_PIN_NAMA_23,
@@ -1061,22 +1236,24 @@ def main():
             print(f"[{name}] steps={steps}, accel_ratio={accel_ratio}, gamma={s_curve_gamma}{extra}, direction={direction}, PID={use_pid} gains={pid_gains if use_pid else '-'}{speed_info}")
 
             enable_motor(h, ena_pin, True)
-            if use_pid and enc is not None and working:
+            if use_pid and enc_channels:
                 logs = move_stepper_scurve_with_pid(
                     h, dir_pin, step_pin, steps, direction,
                     min_delay, max_delay, accel_ratio=accel_ratio,
                     s_curve_gamma=s_curve_gamma,
                     pid_gains=pid_gains,
-                    log_enc=True, enc=enc, enc_channels=working, enc_sample_dt=ENC_SAMPLE_DT,
-                    decel_ratio=decel_ratio, s_curve_gamma_decel=s_curve_gamma_decel
+                    log_enc=True, enc=enc, enc_channels=enc_channels, enc_sample_dt=ENC_SAMPLE_DT,
+                    decel_ratio=decel_ratio, s_curve_gamma_decel=s_curve_gamma_decel,
+                    encoders_dict=encoders_dict
                 )
             else:
                 logs = move_stepper_scurve_with_logging(
                     h, dir_pin, step_pin, steps, direction,
                     min_delay, max_delay, accel_ratio=accel_ratio,
                     s_curve_gamma=s_curve_gamma,
-                    log_enc=(enc is not None), enc=enc, enc_channels=(working if enc else []), enc_sample_dt=ENC_SAMPLE_DT,
-                    decel_ratio=decel_ratio, s_curve_gamma_decel=s_curve_gamma_decel
+                    log_enc=bool(enc_channels), enc=enc, enc_channels=enc_channels, enc_sample_dt=ENC_SAMPLE_DT,
+                    decel_ratio=decel_ratio, s_curve_gamma_decel=s_curve_gamma_decel,
+                    encoders_dict=encoders_dict
                 )
             enable_motor(h, ena_pin, False)
 
@@ -1267,8 +1444,8 @@ def main():
                 pulse_pos_plot = True
 
             usable = []
-            if enc is not None:
-                for ch in (working if working else []):
+            if enc_channels:
+                for ch in enc_channels:
                     key = f"enc_{ch}"
                     y = logs.get(key, None)
                     if y is None or len(y) != len(t):
