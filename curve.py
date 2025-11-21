@@ -1244,7 +1244,7 @@ def main():
                     pid_gains=pid_gains,
                     log_enc=True, enc=enc, enc_channels=enc_channels, enc_sample_dt=ENC_SAMPLE_DT,
                     decel_ratio=decel_ratio, s_curve_gamma_decel=s_curve_gamma_decel,
-                    encoders_dict=encoders_dict
+                    encoders_dict=encoders
                 )
             else:
                 logs = move_stepper_scurve_with_logging(
@@ -1253,7 +1253,7 @@ def main():
                     s_curve_gamma=s_curve_gamma,
                     log_enc=bool(enc_channels), enc=enc, enc_channels=enc_channels, enc_sample_dt=ENC_SAMPLE_DT,
                     decel_ratio=decel_ratio, s_curve_gamma_decel=s_curve_gamma_decel,
-                    encoders_dict=encoders_dict
+                    encoders_dict=encoders
                 )
             enable_motor(h, ena_pin, False)
 
