@@ -1244,7 +1244,7 @@ def main():
                     pid_gains=pid_gains,
                     log_enc=True, enc=enc, enc_channels=enc_channels, enc_sample_dt=ENC_SAMPLE_DT,
                     decel_ratio=decel_ratio, s_curve_gamma_decel=s_curve_gamma_decel,
-                    encoders_dict=encoders
+                    encoders_dict=encoders_dict
                 )
             else:
                 logs = move_stepper_scurve_with_logging(
@@ -1253,7 +1253,7 @@ def main():
                     s_curve_gamma=s_curve_gamma,
                     log_enc=bool(enc_channels), enc=enc, enc_channels=enc_channels, enc_sample_dt=ENC_SAMPLE_DT,
                     decel_ratio=decel_ratio, s_curve_gamma_decel=s_curve_gamma_decel,
-                    encoders_dict=encoders
+                    encoders_dict=encoders_dict
                 )
             enable_motor(h, ena_pin, False)
 
@@ -1335,11 +1335,11 @@ def main():
                         # Quality assessment
                         quality_issues = []
                         if metrics['overshoot_percent'] > 10:
-                            quality_issues.append("⚠️  High overshoot (>10%) - Consider reducing Kp or increasing Kd")
+                            quality_issues.append("?좑툘  High overshoot (>10%) - Consider reducing Kp or increasing Kd")
                         if abs(metrics['steady_state_error_abs']) > 0.5:
-                            quality_issues.append("⚠️  High steady-state error - Consider increasing Ki")
+                            quality_issues.append("?좑툘  High steady-state error - Consider increasing Ki")
                         if metrics['settling_time'] is None:
-                            quality_issues.append("⚠️  System did not settle - Tune gains or increase test duration")
+                            quality_issues.append("?좑툘  System did not settle - Tune gains or increase test duration")
                         
                         if quality_issues:
                             print("PID TUNING RECOMMENDATIONS:")
@@ -1347,7 +1347,7 @@ def main():
                                 print(f"  {issue}")
                             print()
                         else:
-                            print("✅ PID performance is good!\n")
+                            print("??PID performance is good!\n")
                 
                 # Plot PID-specific data
                 if pid_error is not None and len(pid_error) == len(t):
@@ -1401,13 +1401,13 @@ def main():
                 vel_labels = []
                 if cmd_ang_vel is not None:
                     vel_series.append(cmd_ang_vel)
-                    vel_labels.append("commanded ω [deg/s]")
+                    vel_labels.append("commanded ? [deg/s]")
                 if has_pulse_vel:
                     vel_series.append(pulse_deg_per_s)
-                    vel_labels.append("pulse ω raw [deg/s]")
+                    vel_labels.append("pulse ? raw [deg/s]")
                 if has_pulse_vel_f:
                     vel_series.append(pulse_deg_per_s_filtered)
-                    vel_labels.append("pulse ω LPF [deg/s]")
+                    vel_labels.append("pulse ? LPF [deg/s]")
                 plot_time_series(t, vel_series, vel_labels, "Pulse-derived Angular Velocity", "Angular velocity (deg/s)", "pulse_speed_deg")
                 pulse_vel_plot = True
 
@@ -1434,12 +1434,12 @@ def main():
                 pos_labels = []
                 if cmd_angle is not None:
                     pos_series.append(cmd_angle)
-                    pos_labels.append("commanded θ [deg]")
+                    pos_labels.append("commanded 罐 [deg]")
                     pulse_deg_aligned = pulse_deg - pulse_deg[0] + cmd_angle[0]
                 else:
                     pulse_deg_aligned = pulse_deg
                 pos_series.append(pulse_deg_aligned)
-                pos_labels.append("pulse θ [deg]")
+                pos_labels.append("pulse 罐 [deg]")
                 plot_time_series(t, pos_series, pos_labels, "Pulse-derived Angle", "Angle (deg)", "pulse_angle_deg")
                 pulse_pos_plot = True
 
@@ -1470,9 +1470,9 @@ def main():
                 # No encoder data available: fall back to command-only plots (unless already shown).
                 if cmd_rate is not None:
                     if cmd_ang_vel is not None and not pulse_vel_plot:
-                        plot_time_series(t, [cmd_ang_vel], ["commanded ω"], "Commanded Angular Velocity", "Angular velocity (deg/s)", "cmd_angular_velocity")
+                        plot_time_series(t, [cmd_ang_vel], ["commanded ?"], "Commanded Angular Velocity", "Angular velocity (deg/s)", "cmd_angular_velocity")
                         if cmd_angle is not None and not pulse_pos_plot:
-                            plot_time_series(t, [cmd_angle], ["commanded θ"], "Commanded Angle (integrated)", "Angle (deg)", "cmd_angle")
+                            plot_time_series(t, [cmd_angle], ["commanded 罐"], "Commanded Angle (integrated)", "Angle (deg)", "cmd_angle")
                     plot_time_series(t, [cmd_rate], ["cmd step rate"], "Commanded Step Rate", "Steps per second", "cmd_step_rate")
                 continue
 
@@ -1492,17 +1492,17 @@ def main():
                 # Plot encoder angles against commands when available.
                 if cmd_angle is not None:
                     cmd_angle_aligned = cmd_angle - cmd_angle[0] + ang_unwrapped[0]
-                    plot_time_series(t, [ang_unwrapped, cmd_angle_aligned], [f"ch{ch} measured θ", "commanded θ"], f"Encoder ch{ch} Angle", "Angle (deg)", f"ch{ch}_angle_overlay")
+                    plot_time_series(t, [ang_unwrapped, cmd_angle_aligned], [f"ch{ch} measured 罐", "commanded 罐"], f"Encoder ch{ch} Angle", "Angle (deg)", f"ch{ch}_angle_overlay")
                 else:
-                    plot_time_series(t, [ang_unwrapped], [f"ch{ch} measured θ"], f"Encoder ch{ch} Angle", "Angle (deg)", f"ch{ch}_angle")
+                    plot_time_series(t, [ang_unwrapped], [f"ch{ch} measured 罐"], f"Encoder ch{ch} Angle", "Angle (deg)", f"ch{ch}_angle")
 
                 # Likewise compare encoder velocity and acceleration.
                 if cmd_ang_vel is not None:
-                    plot_time_series(t, [vel, cmd_ang_vel], [f"ch{ch} measured ω", "commanded ω"], f"Encoder ch{ch} Angular Velocity", "Angular velocity (deg/s)", f"ch{ch}_angular_velocity_overlay")
+                    plot_time_series(t, [vel, cmd_ang_vel], [f"ch{ch} measured ?", "commanded ?"], f"Encoder ch{ch} Angular Velocity", "Angular velocity (deg/s)", f"ch{ch}_angular_velocity_overlay")
                 else:
-                    plot_time_series(t, [vel], [f"ch{ch} measured ω"], f"Encoder ch{ch} Angular Velocity", "Angular velocity (deg/s)", f"ch{ch}_angular_velocity")
+                    plot_time_series(t, [vel], [f"ch{ch} measured ?"], f"Encoder ch{ch} Angular Velocity", "Angular velocity (deg/s)", f"ch{ch}_angular_velocity")
 
-                plot_time_series(t, [acc], [f"ch{ch} measured α"], f"Encoder ch{ch} Angular Acceleration", "Angular acceleration (deg/s^2)", f"ch{ch}_angular_acceleration")
+                plot_time_series(t, [acc], [f"ch{ch} measured 慣"], f"Encoder ch{ch} Angular Acceleration", "Angular acceleration (deg/s^2)", f"ch{ch}_angular_acceleration")
 
     except KeyboardInterrupt:
         print("\n[Interrupted]")
